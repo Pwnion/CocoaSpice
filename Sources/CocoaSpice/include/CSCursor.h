@@ -30,6 +30,11 @@ NS_ASSUME_NONNULL_BEGIN
 /// You can add an observer on this property to detect when the cursor size changes.
 @property (nonatomic, readonly) CGSize cursorSize;
 
+/// Hotspot of the current cursor image in pixel coordinates relative to the
+/// cursor's top-left corner. Required for callers that want to apply the
+/// guest's cursor shape to a host-native pointer (e.g. NSCursor on macOS).
+@property (nonatomic, readonly) CGPoint cursorHotspot;
+
 /// Set this to true to not render the cursor only if client side cusor rendering is supported.
 /// If it is not supported, this will do nothing.
 @property (nonatomic, assign) BOOL isInhibited;
