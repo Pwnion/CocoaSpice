@@ -16,6 +16,7 @@
 
 @import simd;
 @import MetalKit;
+#import <os/lock.h>
 
 #import "CSMetalRenderer.h"
 #import "CSRenderSource.h"
@@ -87,7 +88,11 @@ NS_ASSUME_NONNULL_END
 
 @interface CSMetalRenderer ()
 
-// Thses must only be accessed by main thread
+// Render state shared between the render-source updater (typically the
+// SPICE thread) and `drawInMTKView:` (which may be called from the
+// MTKView's internal main-thread CADisplayLink *or* from a host-driven
+// background render thread). Access goes through `_renderStateLock`
+// — never read or write these properties without the lock.
 @property (nonatomic, nullable) const _CSRendererSourceData *renderSourceData;
 @property (nonatomic, assign) vector_uint2 renderViewportSize;
 @property (nonatomic) id<MTLSamplerState> renderSampler;
@@ -109,6 +114,14 @@ NS_ASSUME_NONNULL_END
 
     // The command Queue from which we'll obtain command buffers
     id<MTLCommandQueue> _commandQueue;
+
+    // Guards the render-state properties declared above. Acquired by
+    // every setter and by `drawInMTKView:` for a brief snapshot of
+    // the state at frame start. `os_unfair_lock` is cheap when
+    // uncontended (one atomic compare-exchange) and is the recommended
+    // primitive for short critical sections that protect a few words
+    // of state.
+    os_unfair_lock _renderStateLock;
 }
 
 @synthesize device = _device;
@@ -122,7 +135,8 @@ NS_ASSUME_NONNULL_END
     if(self)
     {
         NSError *error = NULL;
-        
+
+        _renderStateLock = OS_UNFAIR_LOCK_INIT;
         _device = mtkView.device;
         [self _setViewportCGSize:mtkView.drawableSize];
         _renderCompletions = [NSMutableArray array];
@@ -184,11 +198,12 @@ NS_ASSUME_NONNULL_END
 
 /// Scalers from VM settings
 - (void)changeUpscaler:(MTLSamplerMinMagFilter)upscaler downscaler:(MTLSamplerMinMagFilter)downscaler {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self _initializeUpscaler:upscaler downscaler:downscaler];
-    });
+    os_unfair_lock_lock(&_renderStateLock);
+    [self _initializeUpscaler:upscaler downscaler:downscaler];
+    os_unfair_lock_unlock(&_renderStateLock);
 }
 
+/// Caller must hold `_renderStateLock`.
 - (void)_setViewportCGSize:(CGSize)size {
     vector_uint2 viewportSize;
 
@@ -201,40 +216,54 @@ NS_ASSUME_NONNULL_END
 - (void)mtkView:(nonnull MTKView *)view drawableSizeWillChange:(CGSize)size {
     // Save the size of the drawable as we'll pass these
     //   values to our vertex shader when we draw
+    os_unfair_lock_lock(&_renderStateLock);
     [self _setViewportCGSize:size];
+    os_unfair_lock_unlock(&_renderStateLock);
 }
 
 - (void)setViewportOrigin:(CGPoint)viewportOrigin {
     if (!CGPointEqualToPoint(_viewportOrigin, viewportOrigin)) {
         _viewportOrigin = viewportOrigin;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            self.renderViewportOrigin = viewportOrigin;
-            self.renderNeedsUpdate = YES;
-        });
+        os_unfair_lock_lock(&_renderStateLock);
+        self.renderViewportOrigin = viewportOrigin;
+        self.renderNeedsUpdate = YES;
+        os_unfair_lock_unlock(&_renderStateLock);
     }
 }
 
 - (void)setViewportScale:(CGFloat)viewportScale {
     if (_viewportScale != viewportScale) {
         _viewportScale = viewportScale;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            self.renderViewportScale = viewportScale;
-            self.renderNeedsUpdate = YES;
-        });
+        os_unfair_lock_lock(&_renderStateLock);
+        self.renderViewportScale = viewportScale;
+        self.renderNeedsUpdate = YES;
+        os_unfair_lock_unlock(&_renderStateLock);
     }
 }
 
-/// Must be called from main thread
+/// Caller must hold `_renderStateLock`.
 - (void)_addDrawCompletion:(completionCallback_t)completion {
     [self.renderCompletions addObject:completion];
 }
 
-/// Must be called from main thread
+/// Drains queued completion callbacks. Takes the lock to snapshot the
+/// list, then dispatches the callbacks on the main queue — preserves
+/// the "completions run on main thread" contract callers had under
+/// the original implementation.
 - (void)_completeDraw {
-    for (completionCallback_t completion in _renderCompletions) {
-        completion();
+    NSArray<completionCallback_t> *snapshot;
+    os_unfair_lock_lock(&_renderStateLock);
+    snapshot = [_renderCompletions copy];
+    [_renderCompletions removeAllObjects];
+    os_unfair_lock_unlock(&_renderStateLock);
+    if (snapshot.count == 0) {
+        return;
     }
-    [self.renderCompletions removeAllObjects];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        for (completionCallback_t completion in snapshot) {
+            completion();
+        }
+    });
 }
 
 /// Create a translation+scale matrix
@@ -270,10 +299,17 @@ static matrix_float4x4 matrix_scale_translate(CGFloat scale, CGPoint translate)
     return m;
 }
 
-/// Called whenever the view needs to render a frame
+/// Called whenever the view needs to render a frame. Safe to call
+/// from any thread — the renderer snapshots its mutable state under
+/// `_renderStateLock` at the top of the frame, then renders with
+/// locals.
 - (void)drawInMTKView:(nonnull MTKView *)view
 {
-    // Obtain a renderPassDescriptor generated from the view's drawable textures
+    // Obtain a renderPassDescriptor generated from the view's drawable
+    // textures. NB: `currentDrawable` blocks waiting for the next
+    // free drawable in the layer's pool. When this method runs on a
+    // dedicated render thread that's fine — only the renderer stalls
+    // under GPU pressure, never the main thread.
     MTLRenderPassDescriptor *renderPassDescriptor = view.currentRenderPassDescriptor;
     id<CAMetalDrawable> currentDrawable = view.currentDrawable;
 
@@ -281,31 +317,39 @@ static matrix_float4x4 matrix_scale_translate(CGFloat scale, CGPoint translate)
         return;
     }
 
+    // Snapshot the render state under the lock so nothing torn slips
+    // through (CGPoint is 16 bytes — not atomic on ARM64). Strong
+    // local references keep _CSRendererSourceData alive even if a
+    // concurrent setter swaps `self.renderSourceData` mid-frame.
+    os_unfair_lock_lock(&_renderStateLock);
     const _CSRendererSourceData *sourceData = self.renderSourceData;
+    BOOL needsUpdate = self.renderNeedsUpdate;
+    CGPoint viewportOrigin = self.renderViewportOrigin;
+    CGFloat viewportScale = self.renderViewportScale;
+    vector_uint2 viewportSize = self.renderViewportSize;
+    id<MTLSamplerState> sampler = self.renderSampler;
+    os_unfair_lock_unlock(&_renderStateLock);
 
-    if (!self.renderNeedsUpdate || !sourceData.isVisible) {
+    if (!needsUpdate || !sourceData.isVisible) {
         [self _completeDraw];
         return;
     }
 
-    // synchronize with rendererQueue in order to access currentCommandBuffer
     id<MTLCommandBuffer> commandBuffer = [_commandQueue commandBuffer];
     commandBuffer.label = @"Draw Frame";
 
     [self _renderCommand:commandBuffer
               drawSource:sourceData
-          viewportOrigin:self.renderViewportOrigin
-           viewportScale:self.renderViewportScale
-            viewportSize:self.renderViewportSize
-                 sampler:self.renderSampler
+          viewportOrigin:viewportOrigin
+           viewportScale:viewportScale
+            viewportSize:viewportSize
+                 sampler:sampler
     renderPassDescriptor:renderPassDescriptor];
 
     [commandBuffer presentDrawable:currentDrawable];
 
     [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> commandBuffer) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self _completeDraw];
-        });
+        [self _completeDraw];
     }];
 
     // Finalize rendering here & push the command buffer to the GPU
@@ -347,13 +391,13 @@ static matrix_float4x4 matrix_scale_translate(CGFloat scale, CGPoint translate)
 
     [commandBuffer commit];
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (completion) {
-            [self _addDrawCompletion:completion];
-        }
-        self.renderSourceData = sourceData;
-        self.renderNeedsUpdate = YES;
-    });
+    os_unfair_lock_lock(&_renderStateLock);
+    if (completion) {
+        [self _addDrawCompletion:completion];
+    }
+    self.renderSourceData = sourceData;
+    self.renderNeedsUpdate = YES;
+    os_unfair_lock_unlock(&_renderStateLock);
 }
 
 - (void)invalidateRenderSource:(id<CSRenderSource>)renderSource
@@ -366,20 +410,20 @@ static matrix_float4x4 matrix_scale_translate(CGFloat scale, CGPoint translate)
         return;
     }
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (completion) {
-            [self _addDrawCompletion:completion];
-        }
-        self.renderSourceData = sourceData;
-        self.renderNeedsUpdate = YES;
-    });
+    os_unfair_lock_lock(&_renderStateLock);
+    if (completion) {
+        [self _addDrawCompletion:completion];
+    }
+    self.renderSourceData = sourceData;
+    self.renderNeedsUpdate = YES;
+    os_unfair_lock_unlock(&_renderStateLock);
 }
 
 - (void)disableRender {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        self.renderSourceData = nil;
-        self.renderNeedsUpdate = NO;
-    });
+    os_unfair_lock_lock(&_renderStateLock);
+    self.renderSourceData = nil;
+    self.renderNeedsUpdate = NO;
+    os_unfair_lock_unlock(&_renderStateLock);
 }
 
 - (BOOL)_renderCommand:(id<MTLCommandBuffer>)commandBuffer
